@@ -1,0 +1,43 @@
+name = "resonant-mind"
+main = "src/index.ts"
+compatibility_date = "2024-12-18"
+compatibility_flags = ["nodejs_compat"]
+
+workers_dev = true
+
+# Uncomment and configure for custom domain:
+# [[routes]]
+# pattern = "your-domain.example.com"
+# custom_domain = true
+
+# Uncomment for Postgres via Hyperdrive (alternative to D1):
+# [[hyperdrive]]
+# binding = "HYPERDRIVE"
+# id = "your-hyperdrive-id"
+
+# R2 for image storage
+[[r2_buckets]]
+binding = "R2_IMAGES"
+bucket_name = "resonant-mind-images"
+
+# Static assets for dashboard
+[assets]
+directory = "./dashboard"
+
+# Cron triggers for subconscious daemon processing
+[triggers]
+crons = ["*/30 * * * *"]
+
+# Environment variables (set via wrangler secret or dashboard):
+# MIND_API_KEY        - Required. API key for authentication
+# GEMINI_API_KEY      - Required. Google Gemini API key for embeddings
+# SIGNING_SECRET      - Optional. Separate secret for signed URLs (defaults to MIND_API_KEY)
+# MCP_CONNECTOR_SECRET - Optional. Secret path for MCP connector auth
+# WEATHER_API_KEY     - Optional. WeatherAPI.com key for inner weather
+# DASHBOARD_ALLOWED_ORIGIN - Optional. CORS origin for dashboard
+# WORKER_URL          - Optional. Public URL of this worker (for signed image URLs)
+# R2_PATH_PREFIX      - Optional. R2 key prefix (default: "resonant-mind-images")
+# LOCATION_NAME       - Optional. Location name (e.g., "London, UK")
+# LOCATION_LAT        - Optional. Latitude
+# LOCATION_LON        - Optional. Longitude
+# LOCATION_TZ         - Optional. Timezone (e.g., "Europe/London")
