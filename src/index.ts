@@ -1602,7 +1602,7 @@ async function handleMindHealth(env: Env): Promise<string> {
     env.DB.prepare(`SELECT COUNT(*) as c FROM journals`).first(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM journals WHERE created_at > ?`).bind(sevenDaysAgo).first(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM identity`).first(),
-    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE charge IS NULL OR charge != 'metabolized'`).first(),
+    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE charge IN ('active', 'processing') OR (charge = 'fresh' AND added_at < ?)`).bind(sevenDaysAgo).first(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM context_entries`).first(),
     env.DB.prepare(`SELECT COUNT(*) as c FROM relational_state`).first(),
     env.DB.prepare(`SELECT context, COUNT(*) as c FROM observations GROUP BY context`).all(),
@@ -1610,7 +1610,7 @@ async function handleMindHealth(env: Env): Promise<string> {
     // v2.0.0 queries
     env.DB.prepare(`SELECT COUNT(*) as c FROM images`).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM daemon_proposals WHERE status = 'pending'`).first().catch(() => ({ c: 0 })),
-    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE (last_surfaced_at IS NULL OR last_surfaced_at < ?) AND charge != 'metabolized'`).bind(thirtyDaysAgo).first().catch(() => ({ c: 0 })),
+    env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE (last_surfaced_at IS NULL OR last_surfaced_at < ?) AND (charge != 'metabolized' OR charge IS NULL) AND added_at < ? AND archived_at IS NULL`).bind(thirtyDaysAgo, sevenDaysAgo).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM observations WHERE archived_at IS NOT NULL`).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM entities WHERE salience = 'foundational'`).first().catch(() => ({ c: 0 })),
     env.DB.prepare(`SELECT COUNT(*) as c FROM entities WHERE salience = 'active' OR salience IS NULL`).first().catch(() => ({ c: 0 })),
@@ -1669,14 +1669,15 @@ async function handleMindHealth(env: Env): Promise<string> {
       subconsciousAge = `${ageHours}h ago`;
     }
 
-    // Score: fresh (<1h) = 100, recent (<2h) = 70, stale (<6h) = 40, very stale = 0
-    if (ageHours < 1) {
+    // Score based on ageMs to avoid rounding mismatches between ageMins and ageHours
+    const ONE_HOUR = 60 * 60 * 1000;
+    if (ageMs < ONE_HOUR) {
       subconsciousScore = 100;
       subconsciousStatus = "fresh";
-    } else if (ageHours < 2) {
+    } else if (ageMs < 2 * ONE_HOUR) {
       subconsciousScore = 70;
       subconsciousStatus = "recent";
-    } else if (ageHours < 6) {
+    } else if (ageMs < 6 * ONE_HOUR) {
       subconsciousScore = 40;
       subconsciousStatus = "stale";
     } else {
@@ -6302,16 +6303,8 @@ async function processSubconscious(env: Env): Promise<void> {
       orphansIdentified++;
     }
 
-    // 4. Update novelty scores - decay recently surfaced, regenerate older ones
-    await env.DB.prepare(`
-      UPDATE observations
-      SET novelty_score = MAX(
-        CASE weight WHEN 'heavy' THEN ${NOVELTY_FLOORS.heavy} WHEN 'medium' THEN ${NOVELTY_FLOORS.medium} ELSE ${NOVELTY_FLOORS.light} END,
-        COALESCE(novelty_score, 1.0) - 0.05
-      )
-      WHERE last_surfaced_at > datetime('now', '-1 day')
-    `).run();
-
+    // 4. Novelty recovery — unsurfaced observations slowly regain novelty
+    // (Decay happens in updateSurfaceTracking when observations actually surface — no double-decay here)
     await env.DB.prepare(`
       UPDATE observations
       SET novelty_score = MIN(1.0,
@@ -6338,7 +6331,7 @@ async function processSubconscious(env: Env): Promise<void> {
           AND (o.last_surfaced_at IS NULL OR o.last_surfaced_at < datetime('now', '-30 days'))
           AND o.added_at < datetime('now', '-${ARCHIVE_AGE_DAYS} days')
           AND (o.charge != 'processing' OR o.charge IS NULL)
-          AND (e.salience != 'foundational' OR e.salience IS NULL)
+          AND COALESCE(e.salience, 'active') != 'foundational'
         UNION
         SELECT o.id
         FROM observations o
@@ -6349,7 +6342,7 @@ async function processSubconscious(env: Env): Promise<void> {
           AND (o.last_surfaced_at IS NULL OR o.last_surfaced_at < datetime('now', '-60 days'))
           AND o.added_at < datetime('now', '-90 days')
           AND (o.charge != 'processing' OR o.charge IS NULL)
-          AND (e.salience != 'foundational' OR e.salience IS NULL)
+          AND COALESCE(e.salience, 'active') != 'foundational'
       )
       LIMIT 50
     `).all();
