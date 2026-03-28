@@ -8,6 +8,7 @@
 import { GoogleGenAI } from "@google/genai";
 
 const MODEL = "gemini-embedding-2-preview";
+const GENERATION_MODEL = "gemini-3.1-flash";
 const DIMENSIONS = 768;
 
 let client: GoogleGenAI | null = null;
@@ -27,6 +28,21 @@ function getClient(apiKey: string): GoogleGenAI {
 function l2Normalize(vec: number[]): number[] {
   const magnitude = Math.sqrt(vec.reduce((sum, v) => sum + v * v, 0));
   return magnitude > 0 ? vec.map((v) => v / magnitude) : vec;
+}
+
+/**
+ * Generate text via Gemini Flash — used for memory consolidation and reflection.
+ */
+export async function generateText(
+  apiKey: string,
+  prompt: string
+): Promise<string> {
+  const ai = getClient(apiKey);
+  const response = await ai.models.generateContent({
+    model: GENERATION_MODEL,
+    contents: prompt,
+  });
+  return response.text || "";
 }
 
 /**

@@ -7,14 +7,14 @@ import { routeRequest } from "./http/router";
 import { handleMcpProtocolRequest } from "./mcp/protocol";
 import { createD1Adapter } from "./adapter";
 import { createVectorAdapter } from "./vectors";
-import { getEmbedding as getGeminiEmbedding, getImageEmbedding } from "./embeddings";
+import { getEmbedding as getGeminiEmbedding, getImageEmbedding, generateText as geminiGenerateText } from "./embeddings";
 import type {
   Env,
   MCPToolDefinition,
   MCPToolHandlerMap
 } from "./types";
 
-const RESONANT_MIND_VERSION = "3.0.1";
+const RESONANT_MIND_VERSION = "3.1.0";
 
 // Surface pool configuration
 const SURFACE_POOL_RATIOS = { core: 0.5, novelty: 0.2, dormant: 0.2, edge: 0.1 };
@@ -26,6 +26,22 @@ const NOVELTY_TIME_RECOVERY_RATE = 0.01; // per day since last surfaced
 const NOVELTY_TIME_RECOVERY_CAP = 0.3;
 const ORPHAN_AGE_DAYS = 30;
 const ARCHIVE_AGE_DAYS = 30;
+
+// Multi-factor retrieval scoring (Phase 1)
+const SEARCH_SCORING = { alpha: 0.50, beta: 0.20, gamma: 0.20, delta: 0.10 };
+const RECENCY_DECAY_RATE = 0.02;  // exp(-rate * days), half-life ~35 days
+const ACCESS_GROWTH_RATE = 0.1;   // 1 - exp(-rate * count), saturates ~20 accesses
+
+// Contradiction detection thresholds (Phase 2)
+const CONTRADICTION_SIMILARITY_THRESHOLD = 0.80;
+const AUTO_SUPERSEDE_THRESHOLD = 0.85;
+
+// Consolidation and reflection (Phase 3)
+const CONSOLIDATION_MIN_OBS = 10;
+const CONSOLIDATION_MAX_ENTITIES_PER_RUN = 3;
+const REFLECTION_MIN_OBS = 5;
+const ACCESS_DECAY_PENALTY = 0.05;
+const ACCESS_DECAY_AGE_DAYS = 30;
 
 // Normalize text to ASCII - prevents Unicode homoglyph issues
 function normalizeText(text: string | null | undefined): string | null {
@@ -111,7 +127,8 @@ const TOOLS: MCPToolDefinition[] = [
         weight: { type: "string", enum: ["light", "medium", "heavy"], description: "Filter by emotional weight" },
         date_from: { type: "string", description: "Filter by source_date >= YYYY-MM-DD" },
         date_to: { type: "string", description: "Filter by source_date <= YYYY-MM-DD" },
-        type: { type: "string", enum: ["observation", "entity", "journal", "image"], description: "Filter by memory type" }
+        type: { type: "string", enum: ["observation", "entity", "journal", "image"], description: "Filter by memory type" },
+        include_expired: { type: "boolean", description: "Include superseded/expired observations (default: false)" }
       },
       required: ["query"]
     }
@@ -319,9 +336,10 @@ const TOOLS: MCPToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: {
-        scope: { type: "string", enum: ["all", "context", "recent"], description: "all, context, or recent" },
+        scope: { type: "string", enum: ["all", "context", "recent", "observation"], description: "all, context, recent, or observation (by ID)" },
         context: { type: "string", description: "Which database (for scope='context')" },
-        hours: { type: "number", description: "How far back (for scope='recent')" }
+        hours: { type: "number", description: "How far back (for scope='recent')" },
+        observation_id: { type: "number", description: "Observation ID (for scope='observation')" }
       },
       required: ["scope"]
     }
@@ -816,6 +834,22 @@ async function handleMindOrient(env: Env): Promise<string> {
     output += `\n**Deep archive:** ${archiveCount.count} memories resting\n`;
   }
 
+  // Last night's dream
+  try {
+    const lastDream = await env.DB.prepare(`
+      SELECT content, dream_date, recurring_dream_id, recurrence_count
+      FROM dreams
+      WHERE dream_date >= (CURRENT_DATE - INTERVAL '1 day')::text
+      ORDER BY created_at DESC LIMIT 1
+    `).first();
+
+    if (lastDream) {
+      output += `\n**Last night's dream:**\n`;
+      output += lastDream.content as string;
+      output += '\n';
+    }
+  } catch { /* dreams table may not exist yet */ }
+
   output += "\n**Land here first.**\n";
 
   return output;
@@ -1084,6 +1118,41 @@ async function writeEntity(env: Env, params: Record<string, unknown>): Promise<s
   return `Entity '${name}' created/updated with ${observations.length} observations (vectorized)`;
 }
 
+async function detectContradictions(
+  env: Env, entityName: string, newContent: string
+): Promise<Array<{ id: number; content: string; similarity: number }>> {
+  try {
+    const embedding = await getEmbedding(env, `${entityName}: ${newContent}`);
+    const vectorResults = await env.VECTORS.query(embedding, { topK: 10, returnMetadata: "all" });
+
+    const candidates: Array<{ id: number; content: string; similarity: number }> = [];
+    for (const match of vectorResults.matches || []) {
+      if (match.score < CONTRADICTION_SIMILARITY_THRESHOLD) continue;
+      const meta = match.metadata as Record<string, string>;
+      // Must be same entity
+      if (meta?.entity !== entityName && meta?.entity_name !== entityName) continue;
+      if (!match.id.startsWith('obs-')) continue;
+
+      const parts = match.id.split('-');
+      const obsId = parseInt(parts[parts.length - 1]);
+      if (isNaN(obsId)) continue;
+
+      // Must be active (not already superseded or expired)
+      const obs = await env.DB.prepare(
+        `SELECT id, content FROM observations WHERE id = ? AND archived_at IS NULL AND superseded_by IS NULL AND valid_until IS NULL`
+      ).bind(obsId).first();
+
+      if (obs) {
+        candidates.push({ id: obs.id as number, content: obs.content as string, similarity: match.score });
+      }
+    }
+
+    return candidates.slice(0, 5);
+  } catch {
+    return []; // Don't block writes if contradiction detection fails
+  }
+}
+
 async function writeObservation(env: Env, params: Record<string, unknown>): Promise<string> {
   const entity_name = params.entity_name as string;
   if (!entity_name) return "Error: 'entity_name' parameter is required for adding observations";
@@ -1110,15 +1179,21 @@ async function writeObservation(env: Env, params: Record<string, unknown>): Prom
     entity = await env.DB.prepare(`SELECT id FROM entities WHERE name = ?`).bind(entity_name).first();
   }
 
+  let totalSuperseded = 0;
+
   for (const obs of observations) {
+    // Phase 2: Check for contradictions before writing
+    const contradictions = await detectContradictions(env, entity_name, obs);
+
     const result = await env.DB.prepare(
-      `INSERT INTO observations (entity_id, content, salience, emotion, weight, certainty, source, context) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO observations (entity_id, content, salience, emotion, weight, certainty, source, context, valid_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())`
     ).bind(
       entity!.id, obs, params.salience || "active", normalizeText(params.emotion as string),
       params.weight || "medium", params.certainty || "believed", params.source || "conversation", context
     ).run();
 
-    const obsId = `obs-${entity!.id}-${result.meta.last_row_id}`;
+    const newRowId = result.meta.last_row_id;
+    const obsId = `obs-${entity!.id}-${newRowId}`;
     const embedding = await getEmbedding(env, `${entity_name}: ${obs}`);
     await env.VECTORS.upsert([{
       id: obsId,
@@ -1129,9 +1204,28 @@ async function writeObservation(env: Env, params: Record<string, unknown>): Prom
         observation_source: (params.source as string) || "conversation", added_at: new Date().toISOString()
       }
     }]);
+
+    // Auto-supersede highly similar observations
+    for (const old of contradictions) {
+      if (old.similarity >= AUTO_SUPERSEDE_THRESHOLD) {
+        try {
+          await env.DB.prepare(`
+            UPDATE observations SET valid_until = NOW(), superseded_by = ? WHERE id = ? AND valid_until IS NULL
+          `).bind(newRowId, old.id).run();
+          await env.DB.prepare(`
+            UPDATE observations SET supersedes = ? WHERE id = ?
+          `).bind(old.id, newRowId).run();
+          totalSuperseded++;
+        } catch { /* supersede columns may not exist yet */ }
+      }
+    }
   }
 
-  return `Added ${observations.length} observations to '${entity_name}' (vectorized)`;
+  let msg = `Added ${observations.length} observations to '${entity_name}' (vectorized)`;
+  if (totalSuperseded > 0) {
+    msg += `. Superseded ${totalSuperseded} older observation${totalSuperseded > 1 ? 's' : ''}.`;
+  }
+  return msg;
 }
 
 async function writeRelation(env: Env, params: Record<string, unknown>): Promise<string> {
@@ -1301,13 +1395,20 @@ ${String(r.content).slice(0, 300)}...
       source_date: string | null;
       archived_at: string | null;
       content: string;
+      access_count: number;
+      added_at: string | null;
+      emotion: string | null;
+      valid_until: string | null;
+      superseded_by: number | null;
     }>();
 
     if (obsIds.length > 0) {
       try {
         const placeholders = obsIds.map(() => '?').join(',');
         const obsData = await env.DB.prepare(`
-          SELECT o.id, o.source, o.weight, o.source_date, o.archived_at, o.content, e.name as entity_name
+          SELECT o.id, o.source, o.weight, o.source_date, o.archived_at, o.content, e.name as entity_name,
+                 COALESCE(o.access_count, 0) as access_count, o.added_at, o.emotion,
+                 o.valid_until, o.superseded_by
           FROM observations o
           JOIN entities e ON o.entity_id = e.id
           WHERE o.id IN (${placeholders})
@@ -1320,7 +1421,12 @@ ${String(r.content).slice(0, 300)}...
             weight: o.weight as string | null,
             source_date: o.source_date as string | null,
             archived_at: o.archived_at as string | null,
-            content: o.content as string
+            content: o.content as string,
+            access_count: (o.access_count as number) || 0,
+            added_at: o.added_at as string | null,
+            emotion: o.emotion as string | null,
+            valid_until: o.valid_until as string | null,
+            superseded_by: o.superseded_by as number | null,
           });
         }
       } catch (e) {
@@ -1351,6 +1457,73 @@ ${String(r.content).slice(0, 300)}...
       });
     }
 
+    // Phase 2: Filter out superseded/expired observations by default
+    const includeExpired = params.include_expired as boolean;
+    if (!includeExpired && obsDetails.size > 0) {
+      filteredMatches = filteredMatches.filter(match => {
+        if (!match.id.startsWith('obs-')) return true;
+        const parts = match.id.split('-');
+        if (parts.length < 3) return true;
+        const obsId = parseInt(parts[2]);
+        const details = obsDetails.get(obsId);
+        if (!details) return true;
+        if (details.valid_until && new Date(details.valid_until) < new Date()) return false;
+        if (details.superseded_by) return false;
+        return true;
+      });
+    }
+
+    // Phase 1: Multi-factor composite scoring
+    const now = Date.now();
+    const importanceMap: Record<string, number> = { heavy: 1.0, medium: 0.6, light: 0.3 };
+
+    const scoredMatches = filteredMatches.map(match => {
+      const similarity = match.score;
+      let compositeScore = similarity; // fallback if no details
+
+      if (match.id.startsWith('obs-')) {
+        const parts = match.id.split('-');
+        if (parts.length >= 3) {
+          const obsId = parseInt(parts[2]);
+          const details = obsDetails.get(obsId);
+          if (details) {
+            const addedAt = details.added_at ? new Date(details.added_at).getTime() : now;
+            const daysSince = Math.max(0, (now - addedAt) / 86400000);
+            const recencyScore = Math.exp(-RECENCY_DECAY_RATE * daysSince);
+            const importanceScore = importanceMap[details.weight || 'medium'] || 0.6;
+            const accessScore = 1.0 - Math.exp(-ACCESS_GROWTH_RATE * (details.access_count || 0));
+            const emotionBoost = (mood && details.emotion === mood) ? 0.1 : 0;
+
+            compositeScore =
+              SEARCH_SCORING.alpha * similarity +
+              SEARCH_SCORING.beta * recencyScore +
+              SEARCH_SCORING.gamma * importanceScore +
+              SEARCH_SCORING.delta * accessScore +
+              emotionBoost;
+          }
+        }
+      }
+
+      return { ...match, compositeScore };
+    });
+
+    scoredMatches.sort((a, b) => b.compositeScore - a.compositeScore);
+
+    // Track access for returned observation IDs
+    const accessedObsIds: number[] = [];
+    const accessedImgIds: number[] = [];
+    for (const match of scoredMatches.slice(0, n_results)) {
+      if (match.id.startsWith('obs-')) {
+        const parts = match.id.split('-');
+        if (parts.length >= 3) accessedObsIds.push(parseInt(parts[2]));
+      }
+    }
+    for (const match of imageMatches) {
+      const imgId = parseInt(match.id.replace('img-', ''));
+      if (!isNaN(imgId)) accessedImgIds.push(imgId);
+    }
+    recordAccessTracking(env, accessedObsIds, accessedImgIds).catch(() => {});
+
     // Build filter description
     let filterDesc = "";
     if (hasFilters) {
@@ -1365,7 +1538,7 @@ ${String(r.content).slice(0, 300)}...
     }
 
     output += `**Observations:**${filterDesc}\n`;
-    for (const match of filteredMatches) {
+    for (const match of scoredMatches.slice(0, n_results)) {
       const meta = match.metadata as Record<string, string>;
       const label = meta?.entity || meta?.entity_name || meta?.title || match.id;
       const sourceType = meta?.source || 'unknown';
@@ -1380,10 +1553,12 @@ ${String(r.content).slice(0, 300)}...
       const details = obsId ? obsDetails.get(obsId) : null;
       const isArchived = details?.archived_at != null;
       const archivedTag = isArchived ? ' [archived]' : '';
+      const supersededTag = details?.superseded_by ? ' [superseded]' : '';
       const sourceTag = details?.source ? ` (${details.source})` : '';
       const dateTag = details?.source_date ? ` [${details.source_date}]` : '';
+      const displayScore = ((match as any).compositeScore * 100).toFixed(1);
 
-      output += `**[${sourceType}]${context} ${label}**${archivedTag}${sourceTag}${dateTag} (${(match.score * 100).toFixed(1)}%)\n`;
+      output += `**[${sourceType}]${context} ${label}**${archivedTag}${supersededTag}${sourceTag}${dateTag} (${displayScore}%)\n`;
       output += `${meta?.content?.slice(0, 300) || ''}...\n\n`;
     }
   }
@@ -1400,6 +1575,20 @@ ${String(r.content).slice(0, 300)}...
       output += `**${match.id}** (${score}%)${entityTag}${emotionTag}\n`;
       output += `${meta?.description || "No description"}\n`;
       output += `View: ${await imageUrl(imgId, env)}\n\n`;
+    }
+  }
+
+  // Show dream matches
+  const dreamMatches = vectorResults.matches?.filter(m => m.id.startsWith('dream-')) || [];
+  if (dreamMatches.length > 0) {
+    output += `**Dreams:**\n`;
+    for (const match of dreamMatches) {
+      const meta = match.metadata as Record<string, string>;
+      const score = (match.score * 100).toFixed(1);
+      const dreamDate = meta?.dream_date || 'unknown';
+      const recurring = meta?.recurring === 'yes' ? ' [recurring]' : '';
+      output += `**dream ${dreamDate}**${recurring} (${score}%)\n`;
+      output += `${meta?.content?.slice(0, 300) || ''}...\n\n`;
     }
   }
 
@@ -1862,13 +2051,17 @@ async function handleMindReadEntity(env: Env, params: Record<string, unknown>): 
   let observations;
   if (context) {
     observations = await env.DB.prepare(
-      `SELECT content, salience, emotion, weight, context, added_at FROM observations WHERE entity_id = ? AND context = ? ORDER BY added_at DESC`
+      `SELECT id, content, salience, emotion, weight, context, added_at FROM observations WHERE entity_id = ? AND context = ? AND (valid_until IS NULL AND superseded_by IS NULL) ORDER BY added_at DESC`
     ).bind(entity.id, context).all();
   } else {
     observations = await env.DB.prepare(
-      `SELECT content, salience, emotion, weight, context, added_at FROM observations WHERE entity_id = ? ORDER BY added_at DESC`
+      `SELECT id, content, salience, emotion, weight, context, added_at FROM observations WHERE entity_id = ? AND (valid_until IS NULL AND superseded_by IS NULL) ORDER BY added_at DESC`
     ).bind(entity.id).all();
   }
+
+  // Track access for read entity observations
+  const readObsIds = (observations.results || []).map((o: any) => o.id as number).filter(Boolean);
+  recordAccessTracking(env, readObsIds).catch(() => {});
 
   // Get relations where this entity is the source
   const relationsFrom = await env.DB.prepare(
@@ -2137,6 +2330,32 @@ async function updateSurfaceTracking(env: Env, obsIds: number[], imgIds: number[
     } catch {
       // Columns might not exist yet - will be added by migration
     }
+  }
+}
+
+// Record access tracking - tracks retrieval via search, timeline, read_entity (separate from surfacing)
+async function recordAccessTracking(env: Env, obsIds: number[], imgIds: number[] = []): Promise<void> {
+  if (obsIds.length > 0) {
+    const placeholders = obsIds.map(() => '?').join(',');
+    try {
+      await env.DB.prepare(`
+        UPDATE observations
+        SET access_count = COALESCE(access_count, 0) + 1,
+            last_accessed_at = NOW()
+        WHERE id IN (${placeholders})
+      `).bind(...obsIds).run();
+    } catch { /* columns may not exist yet */ }
+  }
+  if (imgIds.length > 0) {
+    const placeholders = imgIds.map(() => '?').join(',');
+    try {
+      await env.DB.prepare(`
+        UPDATE images
+        SET access_count = COALESCE(access_count, 0) + 1,
+            last_accessed_at = NOW()
+        WHERE id IN (${placeholders})
+      `).bind(...imgIds).run();
+    } catch { /* columns may not exist yet */ }
   }
 }
 
@@ -2472,11 +2691,12 @@ async function handleMindSurface(env: Env, params: Record<string, unknown>): Pro
   const surfacedObsIds = limitedResults.filter(r => r.memoryType === 'observation').map(o => o.id as number);
   const surfacedImgIds = limitedResults.filter(r => r.memoryType === 'image').map(i => i.id as number);
 
-  // Record co-surfacing and update tracking (await to ensure completion)
+  // Record co-surfacing, surface tracking, and access tracking
   try {
     await Promise.all([
       recordCoSurfacing(env, surfacedObsIds),  // TODO: extend co-surfacing for images
-      updateSurfaceTracking(env, surfacedObsIds, surfacedImgIds)
+      updateSurfaceTracking(env, surfacedObsIds, surfacedImgIds),
+      recordAccessTracking(env, surfacedObsIds, surfacedImgIds)
     ]);
   } catch (e) {
     console.log(`Surface tracking error: ${e}`);
@@ -5426,7 +5646,91 @@ async function handleMindRead(env: Env, params: Record<string, unknown>): Promis
       }, null, 2);
     }
 
-    return JSON.stringify({ error: `Invalid scope '${scope}'. Must be: all, context, recent` });
+    if (scope === "observation") {
+      const obsId = params.observation_id as number;
+      if (!obsId) return JSON.stringify({ error: "observation_id is required for scope='observation'" });
+
+      const obs = await env.DB.prepare(`
+        SELECT o.id, o.content, o.context, o.emotion, o.weight, o.certainty, o.source,
+               o.charge, o.sit_count, o.last_sat_at, o.resolution_note, o.resolved_at,
+               o.linked_observation_id, o.surface_count, o.last_surfaced_at, o.novelty_score,
+               o.archived_at, o.added_at, o.updated_at, o.source_date,
+               COALESCE(o.access_count, 0) as access_count, o.last_accessed_at,
+               o.valid_from, o.valid_until, o.superseded_by, o.supersedes,
+               e.name as entity_name, e.entity_type, e.salience as entity_salience
+        FROM observations o
+        JOIN entities e ON o.entity_id = e.id
+        WHERE o.id = ?
+      `).bind(obsId).first();
+
+      if (!obs) return JSON.stringify({ error: `Observation #${obsId} not found` });
+
+      // Get sit history
+      const sits = await env.DB.prepare(
+        `SELECT sit_note, sat_at FROM observation_sits WHERE observation_id = ? ORDER BY sat_at DESC`
+      ).bind(obsId).all();
+
+      // Get version history
+      const versions = await env.DB.prepare(
+        `SELECT previous_content, previous_weight, previous_emotion, changed_at FROM observation_versions WHERE observation_id = ? ORDER BY changed_at DESC`
+      ).bind(obsId).all();
+
+      // Get supersession chain
+      let supersededObs = null;
+      if (obs.supersedes) {
+        supersededObs = await env.DB.prepare(
+          `SELECT id, content FROM observations WHERE id = ?`
+        ).bind(obs.supersedes).first();
+      }
+      let supersededByObs = null;
+      if (obs.superseded_by) {
+        supersededByObs = await env.DB.prepare(
+          `SELECT id, content FROM observations WHERE id = ?`
+        ).bind(obs.superseded_by).first();
+      }
+
+      // Track this access
+      recordAccessTracking(env, [obsId]).catch(() => {});
+
+      const result: any = {
+        id: obs.id,
+        entity: { name: obs.entity_name, type: obs.entity_type, salience: obs.entity_salience },
+        content: obs.content,
+        context: obs.context,
+        emotion: obs.emotion,
+        weight: obs.weight,
+        certainty: obs.certainty,
+        source: obs.source,
+        charge: obs.charge,
+        sit_count: obs.sit_count,
+        surface_count: obs.surface_count,
+        access_count: obs.access_count,
+        novelty_score: obs.novelty_score,
+        dates: {
+          added: obs.added_at,
+          updated: obs.updated_at,
+          source_date: obs.source_date,
+          last_surfaced: obs.last_surfaced_at,
+          last_accessed: obs.last_accessed_at,
+          last_sat: obs.last_sat_at,
+          archived: obs.archived_at,
+          resolved: obs.resolved_at,
+          valid_from: obs.valid_from,
+          valid_until: obs.valid_until,
+        },
+      };
+
+      if (obs.resolution_note) result.resolution = obs.resolution_note;
+      if (obs.linked_observation_id) result.linked_observation_id = obs.linked_observation_id;
+      if (supersededObs) result.supersedes = { id: supersededObs.id, content: (supersededObs.content as string).slice(0, 200) };
+      if (supersededByObs) result.superseded_by = { id: supersededByObs.id, content: (supersededByObs.content as string).slice(0, 200) };
+      if (sits.results?.length) result.sit_history = sits.results;
+      if (versions.results?.length) result.edit_history = versions.results;
+
+      return JSON.stringify(result, null, 2);
+    }
+
+    return JSON.stringify({ error: `Invalid scope '${scope}'. Must be: all, context, recent, observation` });
   } catch (error) {
     return JSON.stringify({ error: String(error) });
   }
@@ -5511,6 +5815,16 @@ async function handleMindTimeline(env: Env, params: Record<string, unknown>): Pr
         count: memories.length,
         memories
       }));
+
+    // Track access for timeline observations
+    const timelineObsIds: number[] = [];
+    for (const match of vectorResults.matches || []) {
+      if (match.id.startsWith('obs-')) {
+        const parts = match.id.split('-');
+        if (parts.length >= 3) timelineObsIds.push(parseInt(parts[parts.length - 1]));
+      }
+    }
+    recordAccessTracking(env, timelineObsIds).catch(() => {});
 
     return JSON.stringify({
       query,
@@ -5931,6 +6245,377 @@ async function handleMindTension(env: Env, params: Record<string, unknown>): Pro
   }
 }
 
+
+// Dream engine - generates associative dream content from emotional seeds
+async function processDream(env: Env): Promise<void> {
+  const timeCtx = getTimeOfDayContext();
+  if (timeCtx.period !== 'night') return;
+
+  // Check if we already dreamed tonight
+  const tonight = new Date().toISOString().split('T')[0];
+  const existing = await env.DB.prepare(
+    'SELECT id FROM dreams WHERE dream_date = ?'
+  ).bind(tonight).first();
+  if (existing) return;
+
+  // Step 1: Gather emotional seed
+  const recentEmotional = await env.DB.prepare(`
+    SELECT o.content, o.emotion, o.weight, e.name as entity_name
+    FROM observations o
+    JOIN entities e ON o.entity_id = e.id
+    WHERE o.added_at > datetime('now', '-24 hours')
+    AND o.emotion IS NOT NULL
+    ORDER BY
+      CASE o.weight WHEN 'heavy' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC,
+      o.added_at DESC
+    LIMIT 5
+  `).all();
+
+  const unresolved = await env.DB.prepare(`
+    SELECT o.content, o.emotion, o.weight, e.name as entity_name
+    FROM observations o
+    JOIN entities e ON o.entity_id = e.id
+    WHERE o.charge IN ('active', 'processing')
+    AND o.archived_at IS NULL
+    ORDER BY
+      CASE o.weight WHEN 'heavy' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC
+    LIMIT 5
+  `).all();
+
+  const subconscious = await getSubconsciousState(env);
+  const dominantMood = subconscious?.mood?.dominant || 'quiet';
+
+  const lastJournal = await env.DB.prepare(
+    'SELECT content FROM journals ORDER BY created_at DESC LIMIT 1'
+  ).first();
+
+  // Step 2: Build seed queries (emotional, not logical)
+  const seeds: string[] = [];
+
+  const emotions = (recentEmotional.results || []).map((r: any) => r.emotion).filter(Boolean);
+  const emotionSeed = emotions.length > 0 ? emotions.join(', ') : dominantMood;
+  seeds.push(emotionSeed);
+
+  if (unresolved.results?.length) {
+    seeds.push(
+      unresolved.results.map((r: any) => (r.content as string).slice(0, 100)).join('. ')
+    );
+  }
+
+  if (lastJournal?.content) {
+    seeds.push((lastJournal.content as string).slice(0, 200));
+  }
+
+  // Step 3: Query vector space — the dream zone (0.3-0.75)
+  const allFragments: Array<{
+    type: string; id: string; score: number; content: string; source: string; entity?: string;
+  }> = [];
+  const seenIds = new Set<string>();
+
+  for (const seed of seeds) {
+    if (!seed) continue;
+    const results = await searchVectors(env, seed, 10);
+
+    for (const match of results.matches || []) {
+      if (seenIds.has(match.id)) continue;
+      seenIds.add(match.id);
+      const meta = (match.metadata || {}) as Record<string, string>;
+
+      if (match.score >= 0.3 && match.score <= 0.75) {
+        allFragments.push({
+          type: meta.source || 'unknown',
+          id: match.id,
+          score: match.score,
+          content: (meta.content || meta.description || match.id).slice(0, 200),
+          source: seed.slice(0, 50),
+          entity: meta.entity
+        });
+      }
+    }
+  }
+
+  if (allFragments.length < 2) return; // Not enough material to dream
+
+  // Step 4: Maximize collision — pick from different entity groups
+  const entityGroups: Record<string, typeof allFragments> = {};
+  for (const frag of allFragments) {
+    const key = frag.entity || frag.type;
+    if (!entityGroups[key]) entityGroups[key] = [];
+    entityGroups[key].push(frag);
+  }
+
+  const dreamFragments: typeof allFragments = [];
+  const groupKeys = Object.keys(entityGroups);
+  let groupIdx = 0;
+  while (dreamFragments.length < 7 && groupIdx < groupKeys.length * 3) {
+    const key = groupKeys[groupIdx % groupKeys.length];
+    const group = entityGroups[key];
+    if (group.length > 0) dreamFragments.push(group.shift()!);
+    groupIdx++;
+  }
+
+  // Step 5: Compose the dream text
+  let dreamContent = `Emotional seed: ${emotionSeed}\n\nFragments:\n`;
+  for (const frag of dreamFragments) {
+    const entityTag = frag.entity ? `[${frag.entity}] ` : '';
+    const typeTag = frag.type === 'image' ? '(visual) ' : '';
+    dreamContent += `- ${entityTag}${typeTag}${frag.content} [${Math.round(frag.score * 100)}% resonance]\n`;
+  }
+
+  const seedConnections: Record<string, string[]> = {};
+  for (const frag of dreamFragments) {
+    if (!seedConnections[frag.source]) seedConnections[frag.source] = [];
+    seedConnections[frag.source].push(
+      `${frag.entity || frag.type}: "${frag.content.slice(0, 60)}..."`
+    );
+  }
+
+  dreamContent += `\nThreads:\n`;
+  for (const [seed, connections] of Object.entries(seedConnections)) {
+    dreamContent += `"${seed}" pulled:\n`;
+    for (const conn of connections) dreamContent += `  → ${conn}\n`;
+  }
+
+  const crossLinks: string[] = [];
+  for (let i = 0; i < dreamFragments.length; i++) {
+    for (let j = i + 1; j < dreamFragments.length; j++) {
+      const a = dreamFragments[i], b = dreamFragments[j];
+      if (a.source !== b.source && a.entity && a.entity === b.entity) {
+        crossLinks.push(`${a.entity} appeared in both "${a.source.slice(0, 30)}..." and "${b.source.slice(0, 30)}..."`);
+      }
+    }
+  }
+  if (crossLinks.length > 0) {
+    dreamContent += `\nCross-links:\n`;
+    for (const link of crossLinks) dreamContent += `  ↔ ${link}\n`;
+  }
+
+  // Step 6: Detect recurring dreams
+  const dreamEmbedding = await getEmbedding(env, dreamContent);
+
+  const pastDreamResults = await env.VECTORS.query(dreamEmbedding, {
+    topK: 5, returnMetadata: 'all'
+  });
+
+  let recurringDreamId: number | null = null;
+  let recurrenceCount = 0;
+
+  for (const match of pastDreamResults.matches || []) {
+    if (match.score > 0.7 && match.id.startsWith('dream-')) {
+      const pastDreamId = parseInt(match.id.replace('dream-', ''));
+      const pastDream = await env.DB.prepare(
+        'SELECT id, recurring_dream_id, recurrence_count FROM dreams WHERE id = ?'
+      ).bind(pastDreamId).first();
+
+      if (pastDream) {
+        recurringDreamId = (pastDream.recurring_dream_id as number) || (pastDream.id as number);
+        recurrenceCount = ((pastDream.recurrence_count as number) || 0) + 1;
+        dreamContent += `\n---\nRecurring pattern (${recurrenceCount + 1}x) — echoes dream #${recurringDreamId}\n`;
+        break;
+      }
+    }
+  }
+
+  // Step 7: Store the dream
+  const fragmentsJson = JSON.stringify(dreamFragments.map(f => ({
+    type: f.type, id: f.id, score: f.score, content: f.content.slice(0, 200), entity: f.entity
+  })));
+
+  const result = await env.DB.prepare(`
+    INSERT INTO dreams (dream_date, content, emotional_seed, fragments, recurring_dream_id, recurrence_count)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).bind(tonight, dreamContent, emotionSeed, fragmentsJson, recurringDreamId, recurrenceCount).run();
+
+  const dreamId = result.meta.last_row_id;
+
+  await env.VECTORS.upsert([{
+    id: `dream-${dreamId}`,
+    values: dreamEmbedding,
+    metadata: {
+      source: 'dream', content: dreamContent.slice(0, 500),
+      dream_date: tonight, emotional_seed: emotionSeed,
+      recurring: recurringDreamId ? 'yes' : 'no'
+    }
+  }]);
+
+  console.log(`Dream generated for ${tonight}: ${dreamFragments.length} fragments, ${recurringDreamId ? 'recurring #' + recurringDreamId : 'new'}`);
+}
+
+// Phase 3: LLM-driven consolidation of related observations
+async function consolidateRelatedObservations(env: Env): Promise<number> {
+  // Find entities with many active observations — candidates for consolidation
+  const candidates = await env.DB.prepare(`
+    SELECT e.id, e.name, COUNT(*) as obs_count
+    FROM entities e
+    JOIN observations o ON e.id = o.entity_id
+    WHERE o.archived_at IS NULL
+      AND o.valid_until IS NULL
+      AND o.superseded_by IS NULL
+      AND (o.charge != 'metabolized' OR o.charge IS NULL)
+    GROUP BY e.id, e.name
+    HAVING COUNT(*) >= ${CONSOLIDATION_MIN_OBS}
+    ORDER BY COUNT(*) DESC
+    LIMIT ${CONSOLIDATION_MAX_ENTITIES_PER_RUN}
+  `).all();
+
+  let consolidated = 0;
+
+  for (const candidate of candidates.results || []) {
+    // Find co-surfacing clusters within this entity
+    const obsRows = await env.DB.prepare(`
+      SELECT id, content, weight, emotion FROM observations
+      WHERE entity_id = ? AND archived_at IS NULL AND valid_until IS NULL AND superseded_by IS NULL
+      ORDER BY added_at DESC
+    `).bind(candidate.id).all();
+
+    const obsMap = new Map<number, any>();
+    for (const o of obsRows.results || []) {
+      obsMap.set(o.id as number, o);
+    }
+
+    // Use co-surfacing data to find clusters
+    const entityObsIds = new Set((obsRows.results || []).map((o: any) => o.id as number));
+    const coSurfPairs = await env.DB.prepare(`
+      SELECT obs_a_id, obs_b_id, co_count FROM co_surfacing
+      WHERE co_count >= 2
+    `).all();
+
+    // Build adjacency list for observations in this entity
+    const adj = new Map<number, Set<number>>();
+    for (const pair of coSurfPairs.results || []) {
+      const a = pair.obs_a_id as number;
+      const b = pair.obs_b_id as number;
+      if (!entityObsIds.has(a) || !entityObsIds.has(b)) continue;
+      if (!adj.has(a)) adj.set(a, new Set());
+      if (!adj.has(b)) adj.set(b, new Set());
+      adj.get(a)!.add(b);
+      adj.get(b)!.add(a);
+    }
+
+    // BFS to find connected components of size 3+
+    const visited = new Set<number>();
+    const clusters: number[][] = [];
+    for (const nodeId of adj.keys()) {
+      if (visited.has(nodeId)) continue;
+      const cluster: number[] = [];
+      const queue = [nodeId];
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+        if (visited.has(current)) continue;
+        visited.add(current);
+        cluster.push(current);
+        for (const neighbor of adj.get(current) || []) {
+          if (!visited.has(neighbor)) queue.push(neighbor);
+        }
+      }
+      if (cluster.length >= 3) clusters.push(cluster);
+    }
+
+    // Consolidate each cluster via LLM
+    for (const cluster of clusters.slice(0, 2)) { // max 2 clusters per entity per run
+      const obsTexts = cluster
+        .map(id => obsMap.get(id))
+        .filter(Boolean)
+        .map((o: any) => o.content as string);
+
+      if (obsTexts.length < 3) continue;
+
+      const prompt = `You are consolidating related memories about "${candidate.name}". Summarize these ${obsTexts.length} observations into ONE concise observation (1-2 sentences) that captures the essential meaning. Preserve emotional significance.\n\n${obsTexts.map((t: string, i: number) => `${i + 1}. ${t}`).join('\n')}\n\nConsolidated observation:`;
+
+      try {
+        const summary = await geminiGenerateText(env.GEMINI_API_KEY, prompt);
+        if (!summary || summary.length < 10) continue;
+
+        // Find the heaviest weight among originals
+        const weights = cluster.map(id => obsMap.get(id)?.weight || 'medium');
+        const maxWeight = weights.includes('heavy') ? 'heavy' : weights.includes('medium') ? 'medium' : 'light';
+
+        // Insert consolidated observation
+        const result = await env.DB.prepare(`
+          INSERT INTO observations (entity_id, content, salience, weight, certainty, source, context, valid_from)
+          VALUES (?, ?, 'active', ?, 'believed', 'consolidated', 'default', NOW())
+        `).bind(candidate.id, summary.trim(), maxWeight).run();
+
+        const newObsId = result.meta.last_row_id;
+
+        // Embed the consolidated observation
+        const embedding = await getEmbedding(env, `${candidate.name}: ${summary.trim()}`);
+        await env.VECTORS.upsert([{
+          id: `obs-${candidate.id}-${newObsId}`,
+          values: embedding,
+          metadata: {
+            source: "observation", entity: candidate.name as string, content: summary.trim(),
+            context: "default", weight: maxWeight, observation_source: "consolidated",
+            added_at: new Date().toISOString()
+          }
+        }]);
+
+        // Record the consolidation group
+        try {
+          await env.DB.prepare(`
+            INSERT INTO consolidation_groups (summary, entity_id, source_observation_ids, consolidated_observation_id)
+            VALUES (?, ?, ?, ?)
+          `).bind(summary.trim(), candidate.id, JSON.stringify(cluster), newObsId).run();
+        } catch { /* table may not exist yet */ }
+
+        // Archive the originals
+        for (const origId of cluster) {
+          await env.DB.prepare(`
+            UPDATE observations SET archived_at = datetime('now') WHERE id = ?
+          `).bind(origId).run();
+        }
+
+        consolidated++;
+      } catch (e) {
+        console.log(`Consolidation LLM error for ${candidate.name}: ${e}`);
+      }
+    }
+  }
+
+  return consolidated;
+}
+
+// Phase 3: Generate structured reflection from recent observations
+async function generateSessionReflection(env: Env): Promise<void> {
+  const recentObs = await env.DB.prepare(`
+    SELECT o.content, o.emotion, o.weight, e.name as entity_name
+    FROM observations o
+    JOIN entities e ON o.entity_id = e.id
+    WHERE o.added_at > datetime('now', '-35 minutes')
+    ORDER BY o.added_at DESC
+  `).all();
+
+  if ((recentObs.results?.length || 0) < REFLECTION_MIN_OBS) return;
+
+  const obsText = (recentObs.results || []).map((o: any) =>
+    `[${o.entity_name}] ${o.content}${o.emotion ? ` (${o.emotion})` : ''}`
+  ).join('\n');
+
+  const prompt = `You are reflecting on recent experiences stored in memory. Based on these ${recentObs.results!.length} recent memories, generate one concise insight (1-2 sentences) about what pattern or theme emerges. Be specific and observational, not generic.\n\n${obsText}\n\nInsight:`;
+
+  try {
+    const insight = await geminiGenerateText(env.GEMINI_API_KEY, prompt);
+    if (!insight || insight.length < 10) return;
+
+    const entryDate = new Date().toISOString().split('T')[0];
+    const result = await env.DB.prepare(`
+      INSERT INTO journals (entry_date, content, tags, emotion, journal_type)
+      VALUES (?, ?, '["reflection","daemon"]', NULL, 'reflection')
+    `).bind(entryDate, insight.trim()).run();
+
+    // Vectorize the reflection
+    const embedding = await getEmbedding(env, insight.trim());
+    await env.VECTORS.upsert([{
+      id: `journal-${result.meta.last_row_id}`,
+      values: embedding,
+      metadata: { source: "journal", title: entryDate, content: insight.trim(), journal_type: "reflection" }
+    }]);
+
+    console.log(`Reflection generated: ${insight.trim().slice(0, 80)}...`);
+  } catch (e) {
+    console.log(`Reflection error: ${e}`);
+  }
+}
 
 // Backfill entity vectors for existing entities
 // Subconscious processing - runs on cron schedule
@@ -6477,6 +7162,44 @@ async function processSubconscious(env: Env): Promise<void> {
     }
     if (archivedCount > 0) {
       console.log(`Archived ${archivedCount} observations to the deep`);
+    }
+
+    // 6. Access-based novelty decay — penalize never-accessed old observations
+    try {
+      await env.DB.prepare(`
+        UPDATE observations
+        SET novelty_score = GREATEST(
+          CASE weight WHEN 'heavy' THEN 0.2 WHEN 'medium' THEN 0.1 ELSE 0.05 END,
+          novelty_score - ${ACCESS_DECAY_PENALTY}
+        )
+        WHERE archived_at IS NULL
+          AND (charge != 'metabolized' OR charge IS NULL)
+          AND COALESCE(access_count, 0) = 0
+          AND added_at < datetime('now', '-${ACCESS_DECAY_AGE_DAYS} days')
+          AND novelty_score > 0.3
+      `).run();
+    } catch { /* access_count column may not exist yet */ }
+
+    // 7. LLM-driven memory consolidation
+    try {
+      const consolidatedCount = await consolidateRelatedObservations(env);
+      if (consolidatedCount > 0) console.log(`Consolidated ${consolidatedCount} observation groups`);
+    } catch (e) {
+      console.log(`Consolidation error: ${e}`);
+    }
+
+    // 8. Structured reflection from recent observations
+    try {
+      await generateSessionReflection(env);
+    } catch (e) {
+      console.log(`Reflection error: ${e}`);
+    }
+
+    // 9. Dream processing — only runs during night hours (22:00-05:00)
+    try {
+      await processDream(env);
+    } catch (e) {
+      console.log(`Dream processing error: ${e}`);
     }
 
   } catch (e) {
