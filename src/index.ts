@@ -2112,7 +2112,8 @@ async function handleMindReadEntity(env: Env, params: Record<string, unknown>): 
 // Emotional Processing Handlers
 
 async function handleMindSit(env: Env, params: Record<string, unknown>): Promise<string> {
-  const observationId = params.observation_id as number;
+  const rawObsId = params.observation_id;
+  const observationId = rawObsId !== undefined ? Number(rawObsId) : undefined;
   const textMatch = params.text_match as string;
   const semanticQuery = params.query as string;
   const sitNote = params.sit_note as string;
@@ -2192,7 +2193,7 @@ async function handleMindSit(env: Env, params: Record<string, unknown>): Promise
   // Record the sit in history
   await env.DB.prepare(
     `INSERT INTO observation_sits (observation_id, sit_note) VALUES (?, ?)`
-  ).bind(obs.id, sitNote).run();
+  ).bind(obs.id, sitNote || '(sat with it)').run();
 
   const contentPreview = String(obs.content).slice(0, 80);
   const matchInfo = matchMethod === 'semantic' ? ` *(found via "${semanticQuery}")*` : '';
