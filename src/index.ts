@@ -14,7 +14,7 @@ import type {
   MCPToolHandlerMap
 } from "./types";
 
-const RESONANT_MIND_VERSION = "3.1.0";
+const RESONANT_MIND_VERSION = "3.1.2";
 
 // Surface pool configuration
 const SURFACE_POOL_RATIOS = { core: 0.5, novelty: 0.2, dormant: 0.2, edge: 0.1 };
