@@ -16,10 +16,10 @@ database_id = "2e84fcf1-c871-453a-9cba-38784811a97d"
 binding = "VECTORS"
 index_name = "resonant-mind-vectors"
 
-# R2 for image storage (enable R2 in Cloudflare dashboard first)
-# [[r2_buckets]]
-# binding = "R2_IMAGES"
-# bucket_name = "resonant-mind-images"
+# R2 for image storage
+[[r2_buckets]]
+binding = "R2_IMAGES"
+bucket_name = "resonant-mind-images"
 
 # Cron triggers for subconscious daemon processing
 [triggers]
