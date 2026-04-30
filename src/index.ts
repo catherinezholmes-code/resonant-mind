@@ -3012,20 +3012,14 @@ async function handleMindEdit(env: Env, params: Record<string, unknown>): Promis
       return "No updates provided";
     }
 
-    // Preserve previous version before updating
-    let versionNum = 1;
+    // Preserve previous version before updating.
+    // Schema: (id, observation_id, content, weight, emotion, changed_at).
+    // No version_num column — id auto-increments and changed_at orders.
     try {
-      const versionResult = await env.DB.prepare(`
-        SELECT COALESCE(MAX(version_num), 0) as max_version
-        FROM observation_versions
-        WHERE observation_id = ?
-      `).bind(obs.id).first();
-      versionNum = ((versionResult?.max_version as number) || 0) + 1;
-
       await env.DB.prepare(`
-        INSERT INTO observation_versions (observation_id, version_num, content, weight, emotion)
-        VALUES (?, ?, ?, ?, ?)
-      `).bind(obs.id, versionNum, obs.content, obs.weight, obs.emotion).run();
+        INSERT INTO observation_versions (observation_id, content, weight, emotion)
+        VALUES (?, ?, ?, ?)
+      `).bind(obs.id, obs.content, obs.weight, obs.emotion).run();
     } catch (e) {
       console.log(`Version tracking skipped: ${e}`);
     }
@@ -3062,7 +3056,7 @@ async function handleMindEdit(env: Env, params: Record<string, unknown>): Promis
 
     const oldPreview = String(obs.content).slice(0, 50);
     const newPreview = newContent ? newContent.slice(0, 50) : oldPreview;
-    return `Observation #${obs.id} updated (v${versionNum + 1}) ${newContent ? '[re-embedded]' : ''}\nOld: "${oldPreview}..."\nNew: "${newPreview}..."`;
+    return `Observation #${obs.id} updated ${newContent ? '[re-embedded]' : ''}\nOld: "${oldPreview}..."\nNew: "${newPreview}..."`;
   }
 }
 
@@ -5507,9 +5501,10 @@ async function handleApiObservationVersions(request: Request, env: Env, obsId: n
   // GET /api/observations/:id/versions - get version history
   if (request.method === "GET") {
     const versions = await env.DB.prepare(`
-      SELECT * FROM observation_versions
+      SELECT id, observation_id, content, weight, emotion, changed_at
+      FROM observation_versions
       WHERE observation_id = ?
-      ORDER BY version_num DESC
+      ORDER BY id DESC
     `).bind(obsId).all();
 
     return jsonResponse(versions.results);
@@ -5672,7 +5667,7 @@ async function handleMindRead(env: Env, params: Record<string, unknown>): Promis
 
       // Get version history
       const versions = await env.DB.prepare(
-        `SELECT previous_content, previous_weight, previous_emotion, changed_at FROM observation_versions WHERE observation_id = ? ORDER BY changed_at DESC`
+        `SELECT content AS previous_content, weight AS previous_weight, emotion AS previous_emotion, changed_at FROM observation_versions WHERE observation_id = ? ORDER BY changed_at DESC`
       ).bind(obsId).all();
 
       // Get supersession chain
