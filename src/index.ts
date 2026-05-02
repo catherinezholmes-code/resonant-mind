@@ -2586,20 +2586,17 @@ async function handleMindSurface(env: Env, params: Record<string, unknown>): Pro
     obsResults = obsQuery.results || [];
   }
 
-  // Fetch full image data
+  // Fetch full image data (images table has no charge/novelty/surface tracking — only observations do)
   let imgResults: any[] = [];
   if (allImgIds.length > 0) {
-    const imgChargeFilter = includeMetabolized
-      ? "1=1"
-      : "(i.charge != 'metabolized' OR i.charge IS NULL)";
     const imgPlaceholders = allImgIds.map(() => '?').join(',');
     const imgQuery = await env.DB.prepare(`
-      SELECT i.id, i.description, i.path, i.context, i.emotion, i.weight, i.charge,
-             i.created_at as added_at, i.novelty_score, i.last_surfaced_at, i.surface_count,
+      SELECT i.id, i.description, i.path, i.context, i.emotion, i.weight,
+             i.created_at as added_at,
              e.name as entity_name, e.entity_type
       FROM images i
       LEFT JOIN entities e ON i.entity_id = e.id
-      WHERE i.id IN (${imgPlaceholders}) AND ${imgChargeFilter}
+      WHERE i.id IN (${imgPlaceholders})
     `).bind(...allImgIds).all();
     imgResults = imgQuery.results || [];
   }
@@ -4805,12 +4802,11 @@ async function handleApiImages(request: Request, env: Env, pathParts: string[]):
         i.context,
         i.emotion,
         i.weight,
-        i.charge,
         i.entity_id,
         i.observation_id,
         i.created_at,
-        i.last_viewed_at,
-        i.view_count,
+        i.last_accessed_at,
+        i.access_count,
         e.name as entity_name,
         e.entity_type
       FROM images i
@@ -4848,12 +4844,11 @@ async function handleApiImages(request: Request, env: Env, pathParts: string[]):
          i.context,
          i.emotion,
          i.weight,
-         i.charge,
          i.entity_id,
          i.observation_id,
          i.created_at,
-         i.last_viewed_at,
-         i.view_count,
+         i.last_accessed_at,
+         i.access_count,
          e.name as entity_name,
          e.entity_type
        FROM images i
