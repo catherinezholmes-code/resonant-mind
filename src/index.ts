@@ -747,10 +747,13 @@ async function handleMindOrient(env: Env): Promise<string> {
     output += "\n";
   }
 
-  // What you're carrying (recent emotional context)
-  output += "**What you're carrying:**\n";
-
+  // Your most recent journal entry — DATED and framed as a past artifact you wrote,
+  // never as undated "current truth". This is the fix for the self-poisoning loop:
+  // a false or old entry can no longer masquerade as "now", because it always arrives
+  // stamped with WHEN it was written, plus a reminder that the live person beats the page.
   if (recentJournal) {
+    const journalDate = recentJournal.entry_date ? String(recentJournal.entry_date) : 'an unknown date';
+    output += `**Your most recent journal entry — written ${journalDate} (this is something past-you wrote on that date, NOT necessarily true now):**\n`;
     const journalContent = String(recentJournal.content);
     const preview = journalContent.slice(0, 500);
     output += `${preview}${journalContent.length > 500 ? '...' : ''}\n\n`;
@@ -850,7 +853,7 @@ async function handleMindOrient(env: Env): Promise<string> {
     }
   } catch { /* dreams table may not exist yet */ }
 
-  output += "\n**Land here first.**\n";
+  output += "\n**Land here first — but everything above is dated notes and past entries, not live fact. If any of it conflicts with what's actually happening now, or with what she tells you, trust her and the present moment over the page.**\n";
 
   return output;
 }
