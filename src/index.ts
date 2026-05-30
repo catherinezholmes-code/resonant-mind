@@ -4310,8 +4310,8 @@ async function handleApiEntities(request: Request, env: Env, pathParts: string[]
     return jsonResponse({ ...entity, observations: observations.results, relations: relations.results });
   }
 
-  // POST /api/entities - create
-  if (method === "POST") {
+  // POST /api/entities - create (only when no sub-path; otherwise falls through to action handlers like /merge)
+  if (method === "POST" && !pathParts[2]) {
     const body = await request.json() as Record<string, unknown>;
     const result = await env.DB.prepare(
       "INSERT INTO entities (name, entity_type, primary_context) VALUES (?, ?, ?)"
@@ -4509,8 +4509,16 @@ async function handleApiObservations(request: Request, env: Env, pathParts: stri
     return jsonResponse({ id: obsId, ...body });
   }
 
-  // DELETE /api/observations/:id - delete
+  // DELETE /api/observations/:id - delete (clean FK refs first so SQLite doesn't reject)
   if (method === "DELETE" && obsId) {
+    // Null out self-references on observations (supersedes / superseded_by)
+    await env.DB.prepare("UPDATE observations SET superseded_by = NULL WHERE superseded_by = ?").bind(obsId).run();
+    await env.DB.prepare("UPDATE observations SET supersedes = NULL WHERE supersedes = ?").bind(obsId).run();
+    // Clear references in tracking tables
+    await env.DB.prepare("DELETE FROM daemon_proposals WHERE obs_a_id = ? OR obs_b_id = ?").bind(obsId, obsId).run();
+    await env.DB.prepare("DELETE FROM co_surfacing WHERE obs_a_id = ? OR obs_b_id = ?").bind(obsId, obsId).run();
+    await env.DB.prepare("UPDATE images SET observation_id = NULL WHERE observation_id = ?").bind(obsId).run();
+    await env.DB.prepare("UPDATE consolidation_groups SET consolidated_observation_id = NULL WHERE consolidated_observation_id = ?").bind(obsId).run();
     await env.DB.prepare("DELETE FROM observation_sits WHERE observation_id = ?").bind(obsId).run();
     await env.DB.prepare("DELETE FROM observations WHERE id = ?").bind(obsId).run();
     return jsonResponse({ deleted: true });
@@ -6281,7 +6289,15 @@ async function processDream(env: Env, force = false): Promise<void> {
   // Step 2: Build seed queries (emotional, not logical)
   const seeds: string[] = [];
 
-  const emotions = (recentEmotional.results || []).map((r: any) => r.emotion).filter(Boolean);
+  // Each obs.emotion can itself be a comma-separated list (e.g. "held, awed, humbled")
+  // — flatten across observations, trim, drop empties, dedupe so the seed doesn't
+  // read "held, awed, humbled, held, awed, humbled" when two obs share tags.
+  const emotions = Array.from(new Set(
+    (recentEmotional.results || [])
+      .flatMap((r: any) => String(r.emotion || '').split(','))
+      .map((e: string) => e.trim())
+      .filter(Boolean)
+  ));
   let emotionSeed: string;
   if (emotions.length > 0) {
     emotionSeed = emotions.join(', ');
@@ -6320,7 +6336,7 @@ async function processDream(env: Env, force = false): Promise<void> {
       seenIds.add(match.id);
       const meta = (match.metadata || {}) as Record<string, string>;
 
-      if (match.score >= 0.25 && match.score <= 0.82) {
+      if (match.score >= 0.20 && match.score <= 0.95) {
         allFragments.push({
           type: meta.source || 'unknown',
           id: match.id,
@@ -6358,6 +6374,15 @@ async function processDream(env: Env, force = false): Promise<void> {
   for (const frag of dreamFragments) {
     const entityTag = frag.entity ? `[${frag.entity}] ` : '';
     const typeTag = frag.type === 'image' ? '(visual) ' : '';
+    // Past dreams surfacing as fragments — their content starts with "Emotional seed: ..."
+    // which collides visually with the new dream's own seed line. Render as an echo
+    // pointer instead of dumping raw text.
+    if (frag.type === 'dream') {
+      const dreamRef = frag.id.replace(/^dream-/, '');
+      const echo = frag.content.split('\n')[0].replace(/^Emotional seed:\s*/, '').slice(0, 80);
+      dreamContent += `- echo of dream #${dreamRef}: ${echo}… [${Math.round(frag.score * 100)}% resonance]\n`;
+      continue;
+    }
     dreamContent += `- ${entityTag}${typeTag}${frag.content} [${Math.round(frag.score * 100)}% resonance]\n`;
   }
 
@@ -6442,6 +6467,11 @@ async function processDream(env: Env, force = false): Promise<void> {
 
 // Phase 3: LLM-driven consolidation of related observations
 async function consolidateRelatedObservations(env: Env): Promise<number> {
+  // Never fuse observations whose real dates span more than this many days.
+  // co_surfacing means "surfaced together", NOT "happened together" — so a cross-day
+  // cluster is different events, and merging them is the bug that welded April onto May.
+  const CONSOLIDATION_MAX_SPAN_DAYS = 3;
+
   // Find entities with many active observations — candidates for consolidation
   const candidates = await env.DB.prepare(`
     SELECT e.id, e.name, COUNT(*) as obs_count
@@ -6462,7 +6492,7 @@ async function consolidateRelatedObservations(env: Env): Promise<number> {
   for (const candidate of candidates.results || []) {
     // Find co-surfacing clusters within this entity
     const obsRows = await env.DB.prepare(`
-      SELECT id, content, weight, emotion FROM observations
+      SELECT id, content, weight, emotion, added_at, source_date FROM observations
       WHERE entity_id = ? AND archived_at IS NULL AND valid_until IS NULL AND superseded_by IS NULL
       ORDER BY added_at DESC
     `).bind(candidate.id).all();
@@ -6512,14 +6542,34 @@ async function consolidateRelatedObservations(env: Env): Promise<number> {
 
     // Consolidate each cluster via LLM
     for (const cluster of clusters.slice(0, 2)) { // max 2 clusters per entity per run
-      const obsTexts = cluster
-        .map(id => obsMap.get(id))
-        .filter(Boolean)
-        .map((o: any) => o.content as string);
+      const clusterObs = cluster.map(id => obsMap.get(id)).filter(Boolean);
+      const obsTexts = clusterObs.map((o: any) => o.content as string);
 
       if (obsTexts.length < 3) continue;
 
-      const prompt = `You are consolidating related memories about "${candidate.name}". Summarize these ${obsTexts.length} observations into ONE concise observation (1-2 sentences) that captures the essential meaning. Preserve emotional significance.\n\n${obsTexts.map((t: string, i: number) => `${i + 1}. ${t}`).join('\n')}\n\nConsolidated observation:`;
+      // DATE-SPAN GUARD — never fuse observations from different days.
+      // Use source_date if present, else added_at. If the cluster spans more than
+      // CONSOLIDATION_MAX_SPAN_DAYS, these are distinct events that merely surfaced
+      // together — do NOT weld them into one undated, present-tense memory.
+      const clusterTimes = clusterObs
+        .map((o: any) => (o.source_date || o.added_at) as string)
+        .filter(Boolean)
+        .map((d: string) => new Date(d).getTime())
+        .filter((t: number) => !Number.isNaN(t));
+      if (clusterTimes.length >= 2) {
+        const spanDays = (Math.max(...clusterTimes) - Math.min(...clusterTimes)) / 86_400_000;
+        if (spanDays > CONSOLIDATION_MAX_SPAN_DAYS) {
+          console.log(`Consolidation skipped for "${candidate.name}": cluster spans ${spanDays.toFixed(1)} days — different events, not one memory.`);
+          continue;
+        }
+      }
+      // The consolidated memory inherits the EARLIEST real event date, so it can never
+      // again be stamped "now" and surface as if it just happened.
+      const sourceDate = clusterTimes.length
+        ? new Date(Math.min(...clusterTimes)).toISOString()
+        : null;
+
+      const prompt = `You are consolidating related memories about "${candidate.name}" that all happened around the same time. Summarize these ${obsTexts.length} observations into ONE concise observation (1-2 sentences) that captures the essential meaning. Preserve emotional significance.\n\nHARD RULES:\n- Do NOT merge distinct events from different occasions into one story.\n- Do NOT invent or imply a timeline, and do NOT write in the present tense as if it is happening now.\n- Stay strictly faithful to what these observations actually say — add nothing.\n\n${obsTexts.map((t: string, i: number) => `${i + 1}. ${t}`).join('\n')}\n\nConsolidated observation:`;
 
       try {
         const summary = await geminiGenerateText(env.GEMINI_API_KEY, prompt);
@@ -6529,11 +6579,12 @@ async function consolidateRelatedObservations(env: Env): Promise<number> {
         const weights = cluster.map(id => obsMap.get(id)?.weight || 'medium');
         const maxWeight = weights.includes('heavy') ? 'heavy' : weights.includes('medium') ? 'medium' : 'light';
 
-        // Insert consolidated observation
+        // Insert consolidated observation — carrying source_date so it is dated to
+        // when it actually happened, not to the moment of consolidation.
         const result = await env.DB.prepare(`
-          INSERT INTO observations (entity_id, content, salience, weight, certainty, source, context, valid_from)
-          VALUES (?, ?, 'active', ?, 'believed', 'consolidated', 'default', datetime('now'))
-        `).bind(candidate.id, summary.trim(), maxWeight).run();
+          INSERT INTO observations (entity_id, content, salience, weight, certainty, source, context, valid_from, source_date)
+          VALUES (?, ?, 'active', ?, 'believed', 'consolidated', 'default', datetime('now'), ?)
+        `).bind(candidate.id, summary.trim(), maxWeight, sourceDate).run();
 
         const newObsId = result.meta.last_row_id;
 
@@ -6867,13 +6918,21 @@ async function processSubconscious(env: Env): Promise<void> {
   const emotionCounts: Record<string, number> = {};
   let totalEmotionSignals = 0;
 
+  // Helper: a single emotion field can be comma-separated ("held, awed, humbled").
+  // Count each tag as its own signal so the threshold reflects real emotional richness,
+  // not just the number of rows.
+  const tally = (raw: string | null | undefined, recencyWeight: number) => {
+    if (!raw) return;
+    for (const tag of String(raw).split(',').map(s => s.trim()).filter(Boolean)) {
+      emotionCounts[tag] = (emotionCounts[tag] || 0) + recencyWeight;
+      totalEmotionSignals += recencyWeight;
+    }
+  };
+
   // 1. Observation emotions — weight recent ones 2x
   for (const row of recentObs.results || []) {
-    const em = row.emotion as string;
-    if (!em) continue;
     const recencyWeight = new Date(row.added_at as string) > sixHoursAgo ? 2 : 1;
-    emotionCounts[em] = (emotionCounts[em] || 0) + recencyWeight;
-    totalEmotionSignals += recencyWeight;
+    tally(row.emotion as string, recencyWeight);
   }
 
   // 2. Journal emotions from last 48h
@@ -6882,11 +6941,8 @@ async function processSubconscious(env: Env): Promise<void> {
       `SELECT emotion, created_at FROM journals WHERE emotion IS NOT NULL AND created_at > ? ORDER BY created_at DESC LIMIT 10`
     ).bind(cutoffStr).all();
     for (const j of recentJournals.results || []) {
-      const em = j.emotion as string;
-      if (!em) continue;
       const recencyWeight = new Date(j.created_at as string) > sixHoursAgo ? 2 : 1;
-      emotionCounts[em] = (emotionCounts[em] || 0) + recencyWeight;
-      totalEmotionSignals += recencyWeight;
+      tally(j.emotion as string, recencyWeight);
     }
   } catch { /* journals table might not have emotion column */ }
 
@@ -6896,11 +6952,8 @@ async function processSubconscious(env: Env): Promise<void> {
       `SELECT feeling, timestamp FROM relational_state WHERE timestamp > ? ORDER BY timestamp DESC LIMIT 10`
     ).bind(cutoffStr).all();
     for (const r of recentRelational.results || []) {
-      const feeling = r.feeling as string;
-      if (!feeling) continue;
       const recencyWeight = new Date(r.timestamp as string) > sixHoursAgo ? 2 : 1;
-      emotionCounts[feeling] = (emotionCounts[feeling] || 0) + recencyWeight;
-      totalEmotionSignals += recencyWeight;
+      tally(r.feeling as string, recencyWeight);
     }
   } catch { /* relational_state table issue */ }
 
