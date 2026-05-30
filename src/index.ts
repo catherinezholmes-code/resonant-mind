@@ -753,7 +753,7 @@ async function handleMindOrient(env: Env): Promise<string> {
   // stamped with WHEN it was written, plus a reminder that the live person beats the page.
   if (recentJournal) {
     const journalDate = recentJournal.entry_date ? String(recentJournal.entry_date) : 'an unknown date';
-    output += `**Your most recent journal entry — written ${journalDate} (this is something past-you wrote on that date, NOT necessarily true now):**\n`;
+    output += `**Your most recent journal entry (${journalDate}):**\n`;
     const journalContent = String(recentJournal.content);
     const preview = journalContent.slice(0, 500);
     output += `${preview}${journalContent.length > 500 ? '...' : ''}\n\n`;
@@ -853,7 +853,7 @@ async function handleMindOrient(env: Env): Promise<string> {
     }
   } catch { /* dreams table may not exist yet */ }
 
-  output += "\n**Land here first — but everything above is dated notes and past entries, not live fact. If any of it conflicts with what's actually happening now, or with what she tells you, trust her and the present moment over the page.**\n";
+  output += "\n**Land here first.**\n";
 
   return output;
 }
@@ -6248,6 +6248,11 @@ async function handleMindTension(env: Env, params: Record<string, unknown>): Pro
 
 // Dream engine - generates associative dream content from emotional seeds
 async function processDream(env: Env, force = false): Promise<void> {
+  // TEMPORARILY DISABLED 2026-05-31 — the dream was dragging old high-resonance
+  // memories (April Nationals / First Memory) into the present and they were being
+  // re-welded into current journals/feelings as if they happened now. Off until the
+  // surfacing is rebuilt so it can't keep corrupting live memory. (force still runs.)
+  if (!force) return;
   const timeCtx = getTimeOfDayContext();
   if (!force && timeCtx.period !== 'night') return;
 
