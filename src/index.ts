@@ -4826,7 +4826,7 @@ async function handleApiThreads(request: Request, env: Env, pathParts: string[])
   if (method === "POST" && threadId && action === "resolve") {
     const body = await request.json() as Record<string, unknown>;
     await env.DB.prepare(
-      "UPDATE threads SET status = 'resolved', notes = COALESCE(notes, '') || ?, resolved_at = datetime('now') WHERE id = ?"
+      "UPDATE threads SET status = 'resolved', resolution = COALESCE(resolution, '') || ?, resolved_at = datetime('now') WHERE id = ?"
     ).bind("\n[Resolved] " + (body.resolution || ""), threadId).run();
     return jsonResponse({ id: threadId, status: "resolved" });
   }
@@ -4834,7 +4834,7 @@ async function handleApiThreads(request: Request, env: Env, pathParts: string[])
   if (method === "PUT" && threadId) {
     const body = await request.json() as Record<string, unknown>;
     await env.DB.prepare(
-      "UPDATE threads SET content = ?, priority = ?, status = ?, notes = ? WHERE id = ?"
+      "UPDATE threads SET content = ?, priority = ?, status = ?, context = ? WHERE id = ?"
     ).bind(body.content, body.priority, body.status, body.notes || null, threadId).run();
     return jsonResponse({ id: threadId, ...body });
   }
