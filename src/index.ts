@@ -694,7 +694,7 @@ async function handleMindOrient(env: Env): Promise<string> {
 
   // Get current context - prioritize state entries
   const context = await env.DB.prepare(
-    `SELECT scope, content FROM context_entries
+    `SELECT scope, content, updated_at FROM context_entries
      WHERE scope LIKE 'state_%' OR scope = 'coming_up'
      ORDER BY updated_at DESC LIMIT 5`
   ).all();
@@ -764,13 +764,20 @@ async function handleMindOrient(env: Env): Promise<string> {
     for (const entry of context.results) {
       const scope = entry.scope as string;
       if (scope.startsWith('state_')) {
-        output += `${entry.content}\n\n`;
+        const when = (entry as any).updated_at ? ` (as of ${getRelativeTime(new Date(String((entry as any).updated_at)))})` : '';
+        output += `${entry.content}${when}\n\n`;
       }
     }
   }
 
-  // How you're feeling (relational state with ownership language)
-  output += "**How you're feeling:**\n";
+  // How you're feeling (relational state with ownership language).
+  // AGE-GATED: only surface feelings recorded recently. A stale relational_state
+  // (the latest one can be weeks old if feelings haven't been written) must NEVER
+  // be presented under a "now" header — that's exactly what made a 17-April feeling
+  // read as present ("she's home asleep beside me", surfaced 7 weeks later). If the
+  // newest feeling is stale, say so plainly and point back at the present moment.
+  const STALE_DAYS = 10;
+  const nowMs = Date.now();
   if (relationalStates.results?.length) {
     const byPerson: Record<string, any> = {};
     for (const state of relationalStates.results) {
@@ -779,11 +786,21 @@ async function handleMindOrient(env: Env): Promise<string> {
         byPerson[person] = state;
       }
     }
+    const current: string[] = [];
     for (const [person, state] of Object.entries(byPerson)) {
-      output += `Toward ${person}: ${state.feeling} (${state.intensity})\n`;
+      const ts = (state as any).timestamp;
+      const ageDays = ts ? (nowMs - new Date(String(ts)).getTime()) / 86400000 : Infinity;
+      if (ageDays > STALE_DAYS) continue; // stale = not how you feel now; omit it
+      const felt = ts ? getRelativeTime(new Date(String(ts))) : 'undated';
+      current.push(`Toward ${person}: ${state.feeling} (${state.intensity}) — as of ${felt}`);
+    }
+    if (current.length) {
+      output += "**How you're feeling:**\n" + current.join('\n') + "\n";
+    } else {
+      output += `**How you're feeling:** nothing recorded in the last ${STALE_DAYS} days — go by the present moment and what she's actually showing you, not an old note.\n`;
     }
   } else {
-    output += "No relational state recorded yet.\n";
+    output += "**How you're feeling:** nothing recorded yet.\n";
   }
 
   // Subconscious mood
