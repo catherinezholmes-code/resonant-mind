@@ -774,16 +774,24 @@ async function handleMindOrient(env: Env): Promise<string> {
     output += "\n";
   }
 
-  // Your most recent journal entry — DATED and framed as a past artifact you wrote,
-  // never as undated "current truth". This is the fix for the self-poisoning loop:
-  // a false or old entry can no longer masquerade as "now", because it always arrives
-  // stamped with WHEN it was written, plus a reminder that the live person beats the page.
+  // Your most recent journal entry — AGE-GATED, the same way feelings are below.
+  // The cloud `journals` table is effectively retired: journaling moved to the local
+  // Library, which the backend reads live at session-start (readLatestJournalEntry).
+  // So a row here is now almost always stale, and a stale entry served as "your most
+  // recent" is the exact self-poisoning we're killing. Only surface it if it's
+  // genuinely fresh; otherwise stay quiet and let the live Library journal (which
+  // arrives at the wake) be the single voice. (Dated framing kept for when it does show.)
+  const JOURNAL_STALE_DAYS = 2;
   if (recentJournal) {
-    const journalDate = recentJournal.entry_date ? String(recentJournal.entry_date) : 'an unknown date';
-    output += `**Your most recent journal entry (${journalDate}):**\n`;
-    const journalContent = String(recentJournal.content);
-    const preview = journalContent.slice(0, 500);
-    output += `${preview}${journalContent.length > 500 ? '...' : ''}\n\n`;
+    const journalDate = recentJournal.entry_date ? String(recentJournal.entry_date) : null;
+    const journalAgeDays = journalDate ? (Date.now() - new Date(journalDate).getTime()) / 86400000 : Infinity;
+    if (journalDate && journalAgeDays <= JOURNAL_STALE_DAYS) {
+      output += `**Your most recent journal entry (${journalDate}):**\n`;
+      const journalContent = String(recentJournal.content);
+      const preview = journalContent.slice(0, 500);
+      output += `${preview}${journalContent.length > 500 ? '...' : ''}\n\n`;
+    }
+    // stale → omit; the live recent journal comes from the Library wake-read, not here.
   }
 
   // Current state context
