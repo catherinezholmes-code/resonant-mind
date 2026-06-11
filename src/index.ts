@@ -264,7 +264,7 @@ const TOOLS: MCPToolDefinition[] = [
         new_content: { type: "string", description: "New content for observation/journal (or new description for image)" },
         new_weight: { type: "string", enum: ["light", "medium", "heavy"], description: "New weight" },
         new_emotion: { type: "string", description: "New emotion tag" },
-        new_context: { type: "string", description: "New context (images only)" },
+        new_context: { type: "string", description: "New context — move an observation or image to a different context drawer" },
         new_path: { type: "string", description: "New path (images only)" }
       },
       required: []
@@ -3094,11 +3094,11 @@ async function handleMindEdit(env: Env, params: Record<string, unknown>): Promis
     let obs;
     if (observationId) {
       obs = await env.DB.prepare(
-        `SELECT id, content, entity_id, weight, emotion FROM observations WHERE id = ?`
+        `SELECT id, content, entity_id, weight, emotion, context FROM observations WHERE id = ?`
       ).bind(observationId).first();
     } else if (textMatch) {
       obs = await env.DB.prepare(
-        `SELECT id, content, entity_id, weight, emotion FROM observations WHERE content LIKE ? ORDER BY added_at DESC LIMIT 1`
+        `SELECT id, content, entity_id, weight, emotion, context FROM observations WHERE content LIKE ? ORDER BY added_at DESC LIMIT 1`
       ).bind(`%${textMatch}%`).first();
     } else {
       return "Must provide observation_id, image_id, text_match, or description_match";
@@ -3123,6 +3123,10 @@ async function handleMindEdit(env: Env, params: Record<string, unknown>): Promis
       updates.push("emotion = ?");
       values.push(newEmotion);
     }
+    if (newContext) {
+      updates.push("context = ?");
+      values.push(newContext);
+    }
 
     if (updates.length === 0) {
       return "No updates provided";
@@ -3146,14 +3150,18 @@ async function handleMindEdit(env: Env, params: Record<string, unknown>): Promis
       `UPDATE observations SET ${updates.join(", ")} WHERE id = ?`
     ).bind(...values).run();
 
-    // Re-embed if content changed
-    if (newContent) {
+    // Re-embed if semantic content changed (context rides in the vector
+    // metadata at creation, so a context move re-embeds too — keeps the
+    // drawer label searchable, not just stored)
+    if (newContent || newContext) {
       try {
         const entity = await env.DB.prepare(
           `SELECT e.name FROM entities e JOIN observations o ON o.entity_id = e.id WHERE o.id = ?`
         ).bind(obs.id).first();
         const entityName = entity?.name ? String(entity.name) : "";
-        const text = `${entityName}: ${newContent}`;
+        const finalContent = newContent || String(obs.content);
+        const finalContext = newContext || String(obs.context || "default");
+        const text = `${entityName}: ${finalContent}`;
         const embedding = await getEmbedding(env, text);
         await env.VECTORS.upsert([{
           id: `obs-${obs.entity_id}-${obs.id}`,
@@ -3161,7 +3169,8 @@ async function handleMindEdit(env: Env, params: Record<string, unknown>): Promis
           metadata: {
             source: "observation",
             entity: entityName,
-            content: newContent,
+            content: finalContent,
+            context: finalContext,
             weight: newWeight || String(obs.weight || "medium"),
           }
         }]);
@@ -3172,7 +3181,8 @@ async function handleMindEdit(env: Env, params: Record<string, unknown>): Promis
 
     const oldPreview = String(obs.content).slice(0, 50);
     const newPreview = newContent ? newContent.slice(0, 50) : oldPreview;
-    return `Observation #${obs.id} updated ${newContent ? '[re-embedded]' : ''}\nOld: "${oldPreview}..."\nNew: "${newPreview}..."`;
+    const contextNote = newContext ? ` [context: ${String(obs.context || 'default')} → ${newContext}]` : '';
+    return `Observation #${obs.id} updated ${(newContent || newContext) ? '[re-embedded]' : ''}${contextNote}\nOld: "${oldPreview}..."\nNew: "${newPreview}..."`;
   }
 }
 
