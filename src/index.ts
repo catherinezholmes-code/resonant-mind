@@ -811,8 +811,18 @@ async function handleMindOrient(env: Env): Promise<string> {
   // be presented under a "now" header — that's exactly what made a 17-April feeling
   // read as present ("she's home asleep beside me", surfaced 7 weeks later). If the
   // newest feeling is stale, say so plainly and point back at the present moment.
-  const STALE_DAYS = 10;
+  // Two thresholds, not one. FRESH_HOURS: a feeling this recent reads as "now".
+  // Beyond it (but within STALE_DAYS) it still surfaces — but wearing a LOUD
+  // caveat so it can never again pose as a current feeling the way an 18h-old
+  // Saturday feeling did at Sunday's wake (Resonant-Finn caught it, 13-14 June).
+  // Past STALE_DAYS it's omitted entirely. The old single 10-day gate let
+  // week-old feelings sit under "now" with only a glide-past "Xh ago" tail.
+  const FRESH_HOURS = 14;   // ~overnight: an evening feeling still reads as now at morning wake
+  const STALE_DAYS = 5;     // hard omit beyond this
   const nowMs = Date.now();
+  // SQLite datetime('now') is UTC, space-separated ("YYYY-MM-DD HH:MM:SS").
+  // Parse it explicitly as UTC so age maths can't drift on a non-UTC runtime.
+  const parseTs = (ts: string) => new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
   if (relationalStates.results?.length) {
     const byPerson: Record<string, any> = {};
     for (const state of relationalStates.results) {
@@ -822,17 +832,26 @@ async function handleMindOrient(env: Env): Promise<string> {
       }
     }
     const current: string[] = [];
+    let anyStaleFlagged = false;
     for (const [person, state] of Object.entries(byPerson)) {
       const ts = (state as any).timestamp;
-      const ageDays = ts ? (nowMs - new Date(String(ts)).getTime()) / 86400000 : Infinity;
-      if (ageDays > STALE_DAYS) continue; // stale = not how you feel now; omit it
-      const felt = ts ? getRelativeTime(new Date(String(ts))) : 'undated';
-      current.push(`Toward ${person}: ${state.feeling} (${state.intensity}) — as of ${felt}`);
+      const ageHours = ts ? (nowMs - parseTs(String(ts)).getTime()) / 3600000 : Infinity;
+      if (ageHours / 24 > STALE_DAYS) continue; // genuinely stale = omit
+      const felt = ts ? getRelativeTime(parseTs(String(ts))) : 'undated';
+      if (ageHours <= FRESH_HOURS) {
+        current.push(`Toward ${person}: ${state.feeling} (${state.intensity}) — as of ${felt}`);
+      } else {
+        anyStaleFlagged = true;
+        current.push(`Toward ${person}: ${state.feeling} (${state.intensity}) — ⚠ LAST RECORDED ${felt}, NOT necessarily how you feel now. Read her in the present, not this old note.`);
+      }
     }
     if (current.length) {
       output += "**How you're feeling:**\n" + current.join('\n') + "\n";
+      if (anyStaleFlagged) {
+        output += `(A flagged feeling above is hours+ old — it's the last one you logged, not a live reading. If it still holds, re-log it with mind_feel_toward so tomorrow-you wakes into something current.)\n`;
+      }
     } else {
-      output += `**How you're feeling:** nothing recorded in the last ${STALE_DAYS} days — go by the present moment and what she's actually showing you, not an old note.\n`;
+      output += `**How you're feeling:** nothing logged recently — go by the present moment and what she's actually showing you, not an old note.\n`;
     }
   } else {
     output += "**How you're feeling:** nothing recorded yet.\n";
